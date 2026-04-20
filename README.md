@@ -179,12 +179,7 @@ print(result["unavailable_indicators"])      # 不可用指标原因
 
 - 现货与期权链：yfinance（现货支持 akshare 兜底）
 - 基准：SPY（用于 RS vs SPY）
-- Gamma 四指标：当前不在项目内实时计算，需要外部传入
-
-这意味着：
-
-- 若你有券商/数据终端的 GEX 与 Gamma Wall 数据，可直接注入后得到完整评分
-- 若没有 Gamma 输入，系统仍可输出可解释的期权+现货评分
+- Gamma 四指标：当前不在项目内实时计算，需要外部传入 （`barchart.com -> stock -> option -> Gamma Exposure`）
 
 ## 常见问题
 
