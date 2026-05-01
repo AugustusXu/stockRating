@@ -93,3 +93,35 @@ class RatingResult:
             "warnings": self.warnings,
             "unavailable_indicators": self.unavailable_indicators,
         }
+
+
+@dataclass
+class BullScreeningResult:
+    """正股看涨筛选结果。"""
+
+    passed_filter: bool
+    filter_reasons: List[str] = field(default_factory=list)
+    bull_score: int = 0
+    raw_score: int = 0
+    deduction: int = 0
+    deduction_reason: str = ""
+    dimensions: Dict[str, IndicatorResult] = field(default_factory=dict)
+    excess_pct: Optional[float] = None
+    safety_margin: Optional[float] = None
+    tier: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "passed_filter": self.passed_filter,
+            "filter_reasons": self.filter_reasons,
+            "bull_score": self.bull_score,
+            "raw_score": self.raw_score,
+            "deduction": self.deduction,
+            "deduction_reason": self.deduction_reason,
+            "dimensions": {
+                key: value.to_dict() for key, value in self.dimensions.items()
+            },
+            "excess_pct": self.excess_pct,
+            "safety_margin": self.safety_margin,
+            "tier": self.tier,
+        }

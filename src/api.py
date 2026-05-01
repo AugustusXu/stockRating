@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, Iterable, List, Optional
 
+from .bull_screening import BullScreener
 from .config import UNAVAILABLE_INDICATORS
 from .data_loader import MarketDataLoader
-from .features import OptionFeatureCalculator, SpotFeatureCalculator
+from .indicators import IndicatorEngine, default_engine
 from .models import GammaMetrics, IndicatorResult, MarketDataBundle, RatingResult
 from .scoring import (
     classify_votes,
@@ -21,14 +22,16 @@ class StockRatingService:
         source_preference: str = "yfinance_first",
         max_option_expiries: int = 3,
         use_cache: bool = True,
+        engine: IndicatorEngine | None = None,
+        bull_screener: BullScreener | None = None,
     ) -> None:
         self.loader = MarketDataLoader(
             source_preference=source_preference,
             max_option_expiries=max_option_expiries,
             use_cache=use_cache,
         )
-        self.option_calculator = OptionFeatureCalculator()
-        self.spot_calculator = SpotFeatureCalculator()
+        self.engine = engine or default_engine()
+        self.bull_screener = bull_screener or BullScreener()
 
     def get_stock_rating(
         self,
@@ -45,15 +48,47 @@ class StockRatingService:
         if gamma_metrics is None and gamma_reason:
             bundle.warnings.append(f"Gamma数据不可用: {gamma_reason}")
 
-        option_indicators, option_votes = self.option_calculator.calculate(bundle)
-        spot_indicators, spot_votes = self.spot_calculator.calculate(bundle)
-        gamma_indicators = self._build_gamma_indicators(bundle)
+        # ── 通过引擎统一执行所有指标 ──
+        all_indicators, (bull_votes, bear_votes) = self.engine.run(bundle)
 
+        # ── 按 category 分组 ──
+        option_indicators: Dict[str, IndicatorResult] = {}
+        spot_indicators: Dict[str, IndicatorResult] = {}
+        gamma_indicators: Dict[str, IndicatorResult] = {}
+
+        for name, result in all_indicators.items():
+            category = self.engine.get_category(name)
+            if category == "option":
+                option_indicators[name] = result
+            elif category == "spot":
+                spot_indicators[name] = result
+            elif category == "gamma":
+                gamma_indicators[name] = result
+
+        # ── 评分 ──
         option_score = sum_scores(option_indicators)
         spot_score = sum_scores(spot_indicators)
 
-        option_direction = classify_votes(*option_votes)
-        spot_direction = classify_votes(*spot_votes)
+        # ── 方向投票 ──
+        # 引擎已经统一做了投票统计，但为了保持与旧逻辑一致
+        # （期权和现货分开投票），这里按分组重新统计
+        option_bull, option_bear = self._count_votes_for_category(option_indicators)
+        spot_bull, spot_bear = self._count_votes_for_category(spot_indicators)
+
+        # 现货补丁：如果所有指标都没投票，用 daily_return 做兜底
+        if spot_bull == 0 and spot_bear == 0:
+            close = bundle.spot_history["Close"].dropna()
+            if len(close) >= 2:
+                import numpy as np
+                prev = float(close.iloc[-2])
+                dr = float(close.iloc[-1]) / prev - 1 if prev > 0 else 0
+                if dr > 0:
+                    spot_bull = 1
+                elif dr < 0:
+                    spot_bear = 1
+
+        option_direction = classify_votes(option_bull, option_bear)
+        spot_direction = classify_votes(spot_bull, spot_bear)
 
         resonance_bonus, resonance_label, resonance_explain = compute_resonance(
             option_score=option_score,
@@ -88,7 +123,13 @@ class StockRatingService:
                 include_unavailable=include_unavailable,
             ),
         )
-        return result.to_dict()
+        result_dict = result.to_dict()
+
+        # ── 正股看涨筛选 ──
+        bull_result = self.bull_screener.screen(result_dict, bundle)
+        result_dict["bull_screening"] = bull_result.to_dict()
+
+        return result_dict
 
     def get_bulk_stock_ratings(
         self,
@@ -125,98 +166,24 @@ class StockRatingService:
         results.sort(key=lambda item: item.get("total_score", -1), reverse=True)
         return results + failures
 
-    def _build_gamma_indicators(
-        self,
-        bundle: MarketDataBundle,
-    ) -> Dict[str, IndicatorResult]:
-        metrics = bundle.gamma_metrics
-        if metrics is None:
-            runtime_reason = (
-                bundle.gamma_unavailable_reason
-                or "未提供Gamma指标输入，已切换为说明模式。"
-            )
-            return {
-                "GEX净值": IndicatorResult(
-                    name="GEX净值",
-                    raw_value=None,
-                    score=0,
-                    signal="不可用",
-                    explain=f"{UNAVAILABLE_INDICATORS['GEX净值']} 原因: {runtime_reason}",
-                    available=False,
-                ),
-                "GEX环境": IndicatorResult(
-                    name="GEX环境",
-                    raw_value=None,
-                    score=0,
-                    signal="不可用",
-                    explain=f"{UNAVAILABLE_INDICATORS['GEX环境']} 原因: {runtime_reason}",
-                    available=False,
-                ),
-                "γ Wall": IndicatorResult(
-                    name="γ Wall",
-                    raw_value=None,
-                    score=0,
-                    signal="不可用",
-                    explain=f"{UNAVAILABLE_INDICATORS['γ Wall']} 原因: {runtime_reason}",
-                    available=False,
-                ),
-                "Zero Gamma": IndicatorResult(
-                    name="Zero Gamma",
-                    raw_value=None,
-                    score=0,
-                    signal="不可用",
-                    explain=f"{UNAVAILABLE_INDICATORS['Zero Gamma']} 原因: {runtime_reason}",
-                    available=False,
-                ),
-            }
-
-        common_explain = metrics.explain
-        gex_signal = "正Gamma" if (metrics.net_gex or 0.0) >= 0 else "负Gamma"
-
-        indicators: Dict[str, IndicatorResult] = {
-            "GEX净值": IndicatorResult(
-                name="GEX净值",
-                raw_value=round(metrics.net_gex, 4) if metrics.net_gex is not None else None,
-                score=0,
-                signal=gex_signal,
-                explain=common_explain,
-                available=metrics.net_gex is not None,
-            ),
-            "GEX环境": IndicatorResult(
-                name="GEX环境",
-                raw_value=metrics.gex_regime,
-                score=0,
-                signal=metrics.gex_regime,
-                explain=common_explain,
-                available=metrics.gex_regime != "不可用",
-            ),
-            "γ Wall": IndicatorResult(
-                name="γ Wall",
-                raw_value=round(metrics.gamma_wall, 4)
-                if metrics.gamma_wall is not None
-                else None,
-                score=0,
-                signal="关键位" if metrics.gamma_wall is not None else "不可用",
-                explain=common_explain if metrics.gamma_wall is not None else UNAVAILABLE_INDICATORS["γ Wall"],
-                available=metrics.gamma_wall is not None,
-            ),
-            "Zero Gamma": IndicatorResult(
-                name="Zero Gamma",
-                raw_value=round(metrics.zero_gamma, 4)
-                if metrics.zero_gamma is not None
-                else None,
-                score=0,
-                signal="翻转线" if metrics.zero_gamma is not None else "不可用",
-                explain=(
-                    common_explain
-                    if metrics.zero_gamma is not None
-                    else UNAVAILABLE_INDICATORS["Zero Gamma"]
-                ),
-                available=metrics.zero_gamma is not None,
-            ),
-        }
-
-        return indicators
+    def _count_votes_for_category(
+        self, indicators: Dict[str, IndicatorResult]
+    ) -> tuple[int, int]:
+        """按分组统计投票（只统计 participates_in_voting 的指标）。"""
+        bull, bear = 0, 0
+        for name, result in indicators.items():
+            if not result.available:
+                continue
+            # 检查该指标是否参与投票
+            for ind in self.engine._indicators:
+                m = ind.meta()
+                if m.name == name and m.participates_in_voting:
+                    if "看涨" in result.signal and "看跌" not in result.signal:
+                        bull += 1
+                    elif "看跌" in result.signal and "看涨" not in result.signal:
+                        bear += 1
+                    break
+        return bull, bear
 
     def _build_gamma_metrics_from_inputs(
         self,
